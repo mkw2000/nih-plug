@@ -231,5 +231,14 @@ impl Vst3Plugin for MidiInverter {
         &[Vst3SubCategory::Instrument, Vst3SubCategory::Tools];
 }
 
+#[cfg(target_os = "macos")]
+impl Auv2Plugin for MidiInverter {
+    const AUV2_TYPE: [u8; 4] = *b"aumi";
+    const AUV2_SUBTYPE: [u8; 4] = *b"MInv";
+    const AUV2_MANUFACTURER: [u8; 4] = *b"MOIS";
+}
+
 nih_export_clap!(MidiInverter);
 nih_export_vst3!(MidiInverter);
+#[cfg(target_os = "macos")]
+nih_export_auv2!(MidiInverter);

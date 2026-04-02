@@ -11,6 +11,8 @@ description = "A simple but modern API-agnostic audio plugin framework"
 
 [features]
 default = ["vst3"]
+# Enables a macOS AUv2 export target through the `nih_export_auv2!()` macro.
+auv2 = []
 # Enabling this feature will cause the plugin to terminate when allocations
 # occur in the processing function during debug builds. Keep in mind that panics
 # may also allocate if they use string formatting, so temporarily disabling this

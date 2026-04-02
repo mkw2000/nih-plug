@@ -52,9 +52,10 @@ For a list of available crate flags, see
 
 ### Current features
 
-- Supports both VST3 and [CLAP](https://github.com/free-audio/clap) by simply
-  adding the corresponding `nih_export_<api>!(Foo)` macro to your plugin's
-  library.
+- Supports VST3, [CLAP](https://github.com/free-audio/clap), and AUv2 exports
+  from the same plugin crate by adding the corresponding
+  `nih_export_<api>!(Foo)` macros to your plugin's library. AUv2 support is
+  available on macOS through the `auv2` crate feature.
 - Standalone binaries can be made by calling `nih_export_standalone(Foo)` from
   your `main()` function. Standalones come with a CLI for configuration and full
   JACK audio, MIDI, and transport support.
@@ -111,6 +112,10 @@ For a list of available crate flags, see
   - MIDI SysEx is also supported. Plugins can define their own structs or sum
     types to wrap around those messages so they don't need to interact with raw
     byte buffers in the process function.
+- AUv2 support on macOS for audio processing, parameter/state serialization,
+  MIDI input and output callbacks, Cocoa editor views, and multi-bus layouts.
+  This path is newer and has seen less host testing than the CLAP and VST3
+  wrappers.
 - Support for flexible dynamic buffer configurations, including variable numbers
   of input and output ports.
 - First-class support several more exotic CLAP features:
@@ -121,7 +126,8 @@ For a list of available crate flags, see
   `cargo xtask bundle <package> <build_arguments>` command that automatically
   detects which plugin targets your plugin exposes and creates the correct
   plugin bundles for your target operating system and architecture, with
-  cross-compilation support. The cargo subcommand can easily be added to [your
+  cross-compilation support. On macOS this now also includes `.component`
+  bundles for AUv2 plugins. The cargo subcommand can easily be added to [your
   own project](https://github.com/robbert-vdh/nih-plug/tree/main/nih_plug_xtask)
   as an alias or [globally](https://github.com/robbert-vdh/nih-plug/tree/main/cargo_nih_plug)
   as a regular cargo subcommand.
@@ -143,14 +149,26 @@ of the plugin:
 cargo xtask bundle gain --release
 ```
 
+To export AUv2 on macOS, enable the `auv2` feature for the `nih_plug`
+dependency, implement `Auv2Plugin` for your plugin type, and add
+`nih_export_auv2!(YourPlugin);` alongside the other export macros. The bundler
+will detect the exported AUv2 factory and create a `.component` bundle.
+
 ### Plugin formats
 
-NIH-plug can currently export VST3 and
-[CLAP](https://github.com/free-audio/clap) plugins. Exporting a specific plugin
-format for a plugin is as simple as calling the `nih_export_<format>!(Foo);`
-macro. The `cargo xtask bundle` command will detect which plugin formats your
-plugin supports and create the appropriate bundles accordingly, even when cross
-compiling.
+NIH-plug can currently export VST3,
+[CLAP](https://github.com/free-audio/clap), and AUv2 plugins. Exporting a
+specific plugin format for a plugin is as simple as calling the corresponding
+`nih_export_<format>!(Foo);` macro.
+
+- `nih_export_vst3!(Foo);`
+- `nih_export_clap!(Foo);`
+- `nih_export_auv2!(Foo);` on macOS with the `auv2` crate feature enabled and
+  an `impl Auv2Plugin for Foo`
+
+The `cargo xtask bundle` command will detect which plugin formats your plugin
+supports and create the appropriate bundles accordingly, even when cross
+compiling. AUv2 bundling is macOS-only and produces `.component` bundles.
 
 ### Example plugins
 

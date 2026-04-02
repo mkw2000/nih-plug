@@ -210,5 +210,13 @@ impl Vst3Plugin for Gain {
         &[Vst3SubCategory::Fx, Vst3SubCategory::Tools];
 }
 
+#[cfg(target_os = "macos")]
+impl Auv2Plugin for Gain {
+    const AUV2_SUBTYPE: [u8; 4] = *b"Gain";
+    const AUV2_MANUFACTURER: [u8; 4] = *b"MOIS";
+}
+
 nih_export_clap!(Gain);
 nih_export_vst3!(Gain);
+#[cfg(target_os = "macos")]
+nih_export_auv2!(Gain);

@@ -1,6 +1,8 @@
 //! Wrappers for different plugin types. Each wrapper has an entry point macro that you can pass the
 //! name of a type that implements `Plugin` to. The macro will handle the rest.
 
+#[cfg(all(target_os = "macos", feature = "auv2"))]
+pub mod auv2;
 pub mod clap;
 pub mod state;
 pub(crate) mod util;

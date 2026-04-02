@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::slice;
+use std::str;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -48,7 +50,7 @@ pub enum CompilationTarget {
     Windows(Architecture),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
     X86,
     X86_64,
@@ -63,6 +65,43 @@ pub enum Architecture {
 pub enum BundleType {
     Plugin,
     Binary,
+}
+
+const NIH_AUV2_FACTORY_SYMBOL: &str = "NihAudioUnitFactory";
+const NIH_AUV2_METADATA_SYMBOL: &[u8] = b"NihAudioUnitBundlerMetadata\0";
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Auv2BundlerMetadata {
+    type_code: [u8; 4],
+    subtype_code: [u8; 4],
+    manufacturer_code: [u8; 4],
+    name_ptr: *const u8,
+    name_len: usize,
+    vendor_ptr: *const u8,
+    vendor_len: usize,
+    version_ptr: *const u8,
+    version_len: usize,
+    sandbox_safe: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Auv2BundlerMetadataList {
+    ptr: *const Auv2BundlerMetadata,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Auv2Component {
+    type_code: String,
+    subtype_code: String,
+    manufacturer_code: String,
+    name: String,
+    vendor: String,
+    version_string: String,
+    version_number: u32,
+    sandbox_safe: bool,
 }
 
 /// The main xtask entry point function. See the readme for instructions on how to use this.
@@ -384,6 +423,7 @@ fn bundle_binary(
         &standalone_bundle_home,
         compilation_target,
         BundleType::Binary,
+        None,
     )?;
     maybe_codesign(&standalone_bundle_home, compilation_target);
 
@@ -426,7 +466,17 @@ fn bundle_plugin(
         .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
     let bundle_vst3 = symbols::exported(first_lib_path, "GetPluginFactory")
         .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
-    let bundled_plugin = bundle_clap || bundle_vst2 || bundle_vst3;
+    let bundle_auv2 = matches!(
+        compilation_target,
+        CompilationTarget::MacOS(_) | CompilationTarget::MacOSUniversal
+    ) && symbols::exported(first_lib_path, NIH_AUV2_FACTORY_SYMBOL)
+        .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
+    let auv2_components = if bundle_auv2 {
+        Some(load_auv2_components(lib_paths, compilation_target)?)
+    } else {
+        None
+    };
+    let bundled_plugin = bundle_clap || bundle_vst2 || bundle_vst3 || bundle_auv2;
 
     if bundle_clap {
         let clap_bundle_library_name = clap_bundle_library_name(&bundle_name, compilation_target);
@@ -451,6 +501,7 @@ fn bundle_plugin(
             &clap_bundle_home,
             compilation_target,
             BundleType::Plugin,
+            None,
         )?;
         maybe_codesign(&clap_bundle_home, compilation_target);
 
@@ -479,6 +530,7 @@ fn bundle_plugin(
             &vst2_bundle_home,
             compilation_target,
             BundleType::Plugin,
+            None,
         )?;
         maybe_codesign(&vst2_bundle_home, compilation_target);
 
@@ -506,10 +558,38 @@ fn bundle_plugin(
             vst3_bundle_home,
             compilation_target,
             BundleType::Plugin,
+            None,
         )?;
         maybe_codesign(vst3_bundle_home, compilation_target);
 
         eprintln!("Created a VST3 bundle at '{}'", vst3_bundle_home.display());
+    }
+    if let Some(components) = auv2_components.as_deref() {
+        let auv2_lib_path =
+            bundle_home_dir.join(auv2_bundle_library_name(&bundle_name, compilation_target));
+
+        fs::create_dir_all(auv2_lib_path.parent().unwrap())
+            .context("Could not create AUv2 bundle directory")?;
+        util::reflink_or_combine(lib_paths, &auv2_lib_path, compilation_target)
+            .context("Could not create AUv2 bundle")?;
+
+        let auv2_bundle_home = bundle_home_dir.join(
+            Path::new(&auv2_bundle_library_name(&bundle_name, compilation_target))
+                .components()
+                .next()
+                .expect("Malformed AUv2 library path"),
+        );
+        maybe_create_macos_bundle_metadata(
+            package,
+            &bundle_name,
+            &auv2_bundle_home,
+            compilation_target,
+            BundleType::Plugin,
+            Some(components),
+        )?;
+        maybe_codesign(&auv2_bundle_home, compilation_target);
+
+        eprintln!("Created an AUv2 bundle at '{}'", auv2_bundle_home.display());
     }
     if !bundled_plugin {
         eprintln!("Not creating any plugin bundles because the package does not export any plugins")
@@ -691,6 +771,16 @@ fn vst2_bundle_library_name(package: &str, target: CompilationTarget) -> String 
     }
 }
 
+/// The full path to the library file inside of an AUv2 component bundle.
+fn auv2_bundle_library_name(package: &str, target: CompilationTarget) -> String {
+    match target {
+        CompilationTarget::MacOS(_) | CompilationTarget::MacOSUniversal => {
+            format!("{package}.component/Contents/MacOS/{package}")
+        }
+        _ => panic!("AUv2 bundles are only supported on macOS"),
+    }
+}
+
 /// The full path to the library file inside of a VST3 bundle, including the leading `.vst3`
 /// directory.
 ///
@@ -727,16 +817,231 @@ fn vst3_bundle_library_name(package: &str, target: CompilationTarget) -> String 
     }
 }
 
+fn load_auv2_components(
+    lib_paths: &[&Path],
+    compilation_target: CompilationTarget,
+) -> Result<Vec<Auv2Component>> {
+    #[cfg(target_os = "macos")]
+    {
+        use libloading::{Library, Symbol};
+
+        type MetadataFn = unsafe extern "C" fn() -> Auv2BundlerMetadataList;
+
+        let load_path = auv2_metadata_load_path(lib_paths, compilation_target)?;
+        let library = unsafe { Library::new(load_path) }.with_context(|| {
+            format!(
+                "Could not load '{}' to read AUv2 bundler metadata",
+                load_path.display()
+            )
+        })?;
+
+        let metadata_fn: Symbol<'_, MetadataFn> =
+            unsafe { library.get(NIH_AUV2_METADATA_SYMBOL) }.with_context(|| {
+                format!(
+                    "Could not find the AUv2 bundler metadata symbol in '{}'",
+                    load_path.display()
+                )
+            })?;
+
+        let metadata_list = unsafe { metadata_fn() };
+        if metadata_list.ptr.is_null() {
+            anyhow::bail!("The AUv2 bundler metadata symbol returned a null pointer");
+        }
+
+        let raw_metadata = unsafe { slice::from_raw_parts(metadata_list.ptr, metadata_list.len) };
+        if raw_metadata.is_empty() {
+            anyhow::bail!("The AUv2 bundler metadata symbol returned an empty metadata list");
+        }
+
+        raw_metadata
+            .iter()
+            .map(|metadata| {
+                let type_code = fourcc_to_string(metadata.type_code);
+                let subtype_code = fourcc_to_string(metadata.subtype_code);
+                let manufacturer_code = fourcc_to_string(metadata.manufacturer_code);
+                let name = unsafe { decode_metadata_string(metadata.name_ptr, metadata.name_len) }?;
+                let vendor =
+                    unsafe { decode_metadata_string(metadata.vendor_ptr, metadata.vendor_len) }?;
+                let version_string = unsafe {
+                    decode_metadata_string(metadata.version_ptr, metadata.version_len)
+                }?;
+
+                Ok(Auv2Component {
+                    type_code,
+                    subtype_code,
+                    manufacturer_code,
+                    name,
+                    vendor,
+                    version_number: parse_auv2_version(&version_string)?,
+                    version_string,
+                    sandbox_safe: metadata.sandbox_safe,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (lib_paths, compilation_target);
+        anyhow::bail!("AUv2 bundling is only supported when running xtask on macOS");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn auv2_metadata_load_path<'a>(
+    lib_paths: &[&'a Path],
+    compilation_target: CompilationTarget,
+) -> Result<&'a Path> {
+    let first_path = lib_paths.first().copied().context("Empty library paths slice")?;
+
+    let host_arch = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Architecture::X86_64
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            Architecture::AArch64
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Architecture::X86_64
+        }
+    };
+
+    match compilation_target {
+        CompilationTarget::MacOS(target_arch) if target_arch == host_arch => Ok(first_path),
+        CompilationTarget::MacOS(target_arch) => anyhow::bail!(
+            "AUv2 bundling needs to load the built dylib to read its metadata, but this build \
+             targets {:?} while xtask is running on {:?}. Use a native build or \
+             'bundle-universal'.",
+            target_arch,
+            host_arch
+        ),
+        CompilationTarget::MacOSUniversal => match host_arch {
+            Architecture::X86_64 => Ok(first_path),
+            Architecture::AArch64 => lib_paths
+                .get(1)
+                .copied()
+                .context("Missing the aarch64 dylib for AUv2 universal bundling"),
+            _ => Ok(first_path),
+        },
+        _ => anyhow::bail!("AUv2 bundles are only supported for macOS targets"),
+    }
+}
+
+unsafe fn decode_metadata_string(ptr: *const u8, len: usize) -> Result<String> {
+    if ptr.is_null() {
+        anyhow::bail!("AUv2 bundler metadata contained a null string pointer");
+    }
+
+    str::from_utf8(unsafe { slice::from_raw_parts(ptr, len) })
+        .map(|value| value.to_owned())
+        .context("AUv2 bundler metadata contained invalid UTF-8")
+}
+
+fn fourcc_to_string(code: [u8; 4]) -> String {
+    String::from_utf8_lossy(&code).into_owned()
+}
+
+fn parse_auv2_version(version: &str) -> Result<u32> {
+    let version = version
+        .split_once('-')
+        .map(|(stable, _)| stable)
+        .unwrap_or(version);
+    let mut parts = version.split('.');
+
+    let major = parts.next().unwrap_or("0").parse::<u32>().with_context(|| {
+        format!("Could not parse the AUv2 major version component from '{version}'")
+    })?;
+    let minor = parts.next().unwrap_or("0").parse::<u32>().with_context(|| {
+        format!("Could not parse the AUv2 minor version component from '{version}'")
+    })?;
+    let patch = parts.next().unwrap_or("0").parse::<u32>().with_context(|| {
+        format!("Could not parse the AUv2 patch version component from '{version}'")
+    })?;
+
+    Ok((pack_bcd_version(major, 4)? << 16)
+        | (pack_bcd_version(minor, 2)? << 8)
+        | pack_bcd_version(patch, 2)?)
+}
+
+fn pack_bcd_version(value: u32, digits: usize) -> Result<u32> {
+    let decimal = value.to_string();
+    if decimal.len() > digits {
+        anyhow::bail!(
+            "Version component '{}' is too large to fit in {} BCD digits",
+            value,
+            digits
+        );
+    }
+
+    let mut packed = 0_u32;
+    for ch in decimal.bytes() {
+        packed = (packed << 4) | u32::from(ch - b'0');
+    }
+
+    Ok(packed)
+}
+
+fn escape_plist_string(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn audio_components_plist_xml(components: &[Auv2Component]) -> String {
+    let entries = components
+        .iter()
+        .map(|component| {
+            let public_name = if component.vendor.is_empty() {
+                component.name.clone()
+            } else {
+                format!("{}: {}", component.vendor, component.name)
+            };
+            let sandbox_safe = if component.sandbox_safe {
+                "      <true/>"
+            } else {
+                "      <false/>"
+            };
+
+            format!(
+                "      <dict>\n        <key>description</key>\n        <string>{}</string>\n        \
+         <key>factoryFunction</key>\n        <string>{}</string>\n        \
+         <key>manufacturer</key>\n        <string>{}</string>\n        <key>name</key>\n        \
+         <string>{}</string>\n        <key>sandboxSafe</key>\n{}\n        <key>subtype</key>\n   \
+      <string>{}</string>\n        <key>type</key>\n        <string>{}</string>\n        \
+         <key>version</key>\n        <integer>{}</integer>\n      </dict>",
+                escape_plist_string(&component.name),
+                NIH_AUV2_FACTORY_SYMBOL,
+                escape_plist_string(&component.manufacturer_code),
+                escape_plist_string(&public_name),
+                sandbox_safe,
+                escape_plist_string(&component.subtype_code),
+                escape_plist_string(&component.type_code),
+                component.version_number
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "    <key>AudioComponents</key>\n    <array>\n{entries}\n    </array>\n"
+    )
+}
+
 /// If compiling for macOS, create all of the bundl-y stuff Steinberg and Apple require you to have.
 ///
 /// This still requires you to move the dylib file to `{bundle_home}/Contents/macOS/{package}`
 /// yourself first.
-pub fn maybe_create_macos_bundle_metadata(
+fn maybe_create_macos_bundle_metadata(
     package: &str,
     display_name: &str,
     bundle_home: &Path,
     target: CompilationTarget,
     bundle_type: BundleType,
+    auv2_components: Option<&[Auv2Component]>,
 ) -> Result<()> {
     if !matches!(
         target,
@@ -749,6 +1054,13 @@ pub fn maybe_create_macos_bundle_metadata(
         BundleType::Plugin => "BNDL",
         BundleType::Binary => "APPL",
     };
+    let bundle_version = auv2_components
+        .and_then(|components| components.first())
+        .map(|component| component.version_string.as_str())
+        .unwrap_or("1.0.0");
+    let audio_components_xml = auv2_components
+        .map(audio_components_plist_xml)
+        .unwrap_or_default();
 
     // TODO: May want to add bundler.toml fields for the identifier, version and signature at some
     //       point.
@@ -765,30 +1077,40 @@ pub fn maybe_create_macos_bundle_metadata(
 <plist>
   <dict>
     <key>CFBundleExecutable</key>
-    <string>{display_name}</string>
+    <string>{}</string>
     <key>CFBundleIconFile</key>
     <string></string>
     <key>CFBundleIdentifier</key>
-    <string>com.nih-plug.{package}</string>
+    <string>com.nih-plug.{}</string>
     <key>CFBundleName</key>
-    <string>{display_name}</string>
+    <string>{}</string>
     <key>CFBundleDisplayName</key>
-    <string>{display_name}</string>
+    <string>{}</string>
     <key>CFBundlePackageType</key>
-    <string>{package_type}</string>
+    <string>{}</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>{}</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>{}</string>
     <key>NSHumanReadableCopyright</key>
     <string></string>
     <key>NSHighResolutionCapable</key>
     <true/>
+{}
   </dict>
 </plist>
-"#),
+"#,
+            escape_plist_string(display_name),
+            escape_plist_string(package),
+            escape_plist_string(display_name),
+            escape_plist_string(display_name),
+            package_type,
+            escape_plist_string(bundle_version),
+            escape_plist_string(bundle_version),
+            audio_components_xml
+        ),
     )
     .context("Could not create Info.plist file")?;
 

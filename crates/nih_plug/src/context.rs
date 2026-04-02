@@ -13,6 +13,7 @@ pub mod remote_controls;
 /// plugin's GUI for debugging purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginApi {
+    Auv2,
     Clap,
     Standalone,
     Vst3,
@@ -21,6 +22,7 @@ pub enum PluginApi {
 impl Display for PluginApi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PluginApi::Auv2 => write!(f, "AUv2"),
             PluginApi::Clap => write!(f, "CLAP"),
             PluginApi::Standalone => write!(f, "standalone"),
             PluginApi::Vst3 => write!(f, "VST3"),

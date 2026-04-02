@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nih_plug = { path = "../../crates/nih_plug", features = [
+    "auv2",
     "assert_process_allocs",
 ] }
 parking_lot.workspace = true

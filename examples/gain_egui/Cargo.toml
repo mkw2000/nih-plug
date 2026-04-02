@@ -20,6 +20,7 @@ crate-type = ["cdylib", "lib"]
 egui = { workspace = true, features = ["default_fonts"] }
 nih_plug = { path = "../../crates/nih_plug", default-features = true, features = [
     "assert_process_allocs",
+    "auv2",
     "standalone",
     "standalone-opengl",
 ] }

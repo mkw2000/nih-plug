@@ -8,6 +8,8 @@ use crate::prelude::{
     MidiConfig, Params, PluginState, ProcessContext, SysExMessage,
 };
 
+#[cfg(all(target_os = "macos", feature = "auv2"))]
+pub mod auv2;
 pub mod clap;
 #[cfg(feature = "vst3")]
 pub mod vst3;
