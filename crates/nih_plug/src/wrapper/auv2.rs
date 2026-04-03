@@ -184,6 +184,7 @@ pub const NIH_AUV2_FACTORY_SYMBOL: &str = "NihAudioUnitFactory";
 pub const NIH_AUV2_METADATA_SYMBOL: &str = "NihAudioUnitBundlerMetadata";
 const COCOA_VIEW_STATE_IVAR: &str = "nihStatePtr";
 static COCOA_CLASS_REGISTRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static AUDIO_UNIT_INSTANCE_WRAPPERS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
 
 type OSStatus = i32;
 type OSType = u32;
@@ -236,6 +237,12 @@ pub struct AudioBuffer {
 pub struct AudioBufferList {
     pub mNumberBuffers: u32,
     pub mBuffers: [AudioBuffer; 1],
+}
+
+impl AudioBufferList {
+    unsafe fn buffers(&self) -> &[AudioBuffer] {
+        unsafe { slice::from_raw_parts(self.mBuffers.as_ptr(), self.mNumberBuffers as usize) }
+    }
 }
 
 #[repr(C)]
@@ -622,6 +629,7 @@ struct RenderState {
 }
 
 struct CocoaViewState<P: Auv2Plugin> {
+    view: *mut Object,
     wrapper: Arc<Wrapper<P>>,
     _gui_context: Arc<WrapperGuiContext<P>>,
     _editor_handle: Box<dyn Any + Send>,
@@ -644,6 +652,10 @@ unsafe impl<P: Auv2Plugin> Sync for IOBuffers<P> {}
 
 impl<P: Auv2Plugin> Drop for CocoaViewState<P> {
     fn drop(&mut self) {
+        if self.wrapper.cocoa_view.load() == self.view as usize {
+            self.wrapper.cocoa_view.store(0);
+        }
+
         self.wrapper.open_editor_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -664,6 +676,8 @@ pub struct Wrapper<P: Auv2Plugin> {
     supported_channel_infos: Vec<AUChannelInfo>,
 
     current_audio_io_layout: AtomicCell<AudioIOLayout>,
+    component_instance: AtomicCell<usize>,
+    cocoa_view: AtomicCell<usize>,
     sample_rate: AtomicCell<f64>,
     maximum_frames_per_slice: AtomicU32,
     current_buffer_config: AtomicCell<Option<BufferConfig>>,
@@ -772,6 +786,8 @@ impl<P: Auv2Plugin> Wrapper<P> {
             supported_channel_infos,
 
             current_audio_io_layout: AtomicCell::new(initial_audio_io_layout),
+            component_instance: AtomicCell::new(0),
+            cocoa_view: AtomicCell::new(0),
             sample_rate: AtomicCell::new(DEFAULT_SAMPLE_RATE),
             maximum_frames_per_slice: AtomicU32::new(DEFAULT_MAX_FRAMES_PER_SLICE),
             current_buffer_config: AtomicCell::new(None),
@@ -786,7 +802,7 @@ impl<P: Auv2Plugin> Wrapper<P> {
                 .collect(),
             host_callbacks: AtomicCell::new(None),
             midi_output_callback: AtomicCell::new(None),
-            in_place_processing: AtomicBool::new(true),
+            in_place_processing: AtomicBool::new(Self::can_process_in_place(initial_audio_io_layout)),
 
             buffer_manager: AtomicRefCell::new(BufferManager::for_audio_io_layout(
                 0,
@@ -980,6 +996,14 @@ impl<P: Auv2Plugin> Wrapper<P> {
         counts
     }
 
+    fn can_process_in_place(layout: AudioIOLayout) -> bool {
+        let input_channels = Self::bus_channel_counts_for_layout(layout, K_AUDIO_UNIT_SCOPE_INPUT);
+        let output_channels =
+            Self::bus_channel_counts_for_layout(layout, K_AUDIO_UNIT_SCOPE_OUTPUT);
+
+        !input_channels.is_empty() && input_channels == output_channels
+    }
+
     fn match_audio_io_layout_by_busses(
         &self,
         input_channels: &[u32],
@@ -1113,6 +1137,8 @@ impl<P: Auv2Plugin> Wrapper<P> {
         match new_layout {
             Some(layout) => {
                 self.current_audio_io_layout.store(layout);
+                self.in_place_processing
+                    .store(Self::can_process_in_place(layout), Ordering::Relaxed);
                 self.sample_rate.store(stream_format.mSampleRate);
                 0
             }
@@ -1991,18 +2017,33 @@ impl<P: Auv2Plugin> GuiContext for WrapperGuiContext<P> {
     }
 
     fn request_resize(&self) -> bool {
-        false
+        let cocoa_view = self.wrapper.cocoa_view.load() as *mut Object;
+        if cocoa_view.is_null() {
+            return false;
+        }
+
+        let editor_guard = self.wrapper.editor.borrow();
+        let Some(editor) = editor_guard.as_ref() else {
+            return false;
+        };
+        let (width, height) = editor.lock().size();
+
+        unsafe { resize_cocoa_view(cocoa_view, width as f64, height as f64) }
     }
 
     unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {
         let Some(hash) = self.wrapper.param_ptr_to_hash.get(&param).copied() else {
             return;
         };
+        let audio_unit = self.wrapper.component_instance.load() as AudioUnit;
+        if audio_unit.is_null() {
+            return;
+        }
         let event = AudioUnitEvent {
             mEventType: K_AUDIO_UNIT_EVENT_BEGIN_PARAMETER_CHANGE_GESTURE,
             mArgument: AudioUnitEventArgument {
                 mParameter: AudioUnitParameter {
-                    mAudioUnit: Arc::as_ptr(&self.wrapper) as AudioUnit,
+                    mAudioUnit: audio_unit,
                     mParameterID: hash,
                     mScope: K_AUDIO_UNIT_SCOPE_GLOBAL,
                     mElement: 0,
@@ -2020,21 +2061,29 @@ impl<P: Auv2Plugin> GuiContext for WrapperGuiContext<P> {
             return;
         };
         let plain_value = unsafe { param.preview_plain(normalized) };
+        let audio_unit = self.wrapper.component_instance.load() as AudioUnit;
+        if audio_unit.is_null() {
+            let _ = self.wrapper.apply_parameter_change(hash, normalized);
+            return;
+        }
         let parameter = AudioUnitParameter {
-            mAudioUnit: Arc::as_ptr(&self.wrapper) as AudioUnit,
+            mAudioUnit: audio_unit,
             mParameterID: hash,
             mScope: K_AUDIO_UNIT_SCOPE_GLOBAL,
             mElement: 0,
         };
 
-        unsafe {
-            let _ = AUParameterSet(
+        let status = unsafe {
+            AUParameterSet(
                 ptr::null_mut(),
                 ptr::null_mut(),
                 &parameter,
                 plain_value,
                 0,
-            );
+            )
+        };
+        if status != 0 {
+            let _ = self.wrapper.apply_parameter_change(hash, normalized);
         }
     }
 
@@ -2042,11 +2091,15 @@ impl<P: Auv2Plugin> GuiContext for WrapperGuiContext<P> {
         let Some(hash) = self.wrapper.param_ptr_to_hash.get(&param).copied() else {
             return;
         };
+        let audio_unit = self.wrapper.component_instance.load() as AudioUnit;
+        if audio_unit.is_null() {
+            return;
+        }
         let event = AudioUnitEvent {
             mEventType: K_AUDIO_UNIT_EVENT_END_PARAMETER_CHANGE_GESTURE,
             mArgument: AudioUnitEventArgument {
                 mParameter: AudioUnitParameter {
-                    mAudioUnit: Arc::as_ptr(&self.wrapper) as AudioUnit,
+                    mAudioUnit: audio_unit,
                     mParameterID: hash,
                     mScope: K_AUDIO_UNIT_SCOPE_GLOBAL,
                     mElement: 0,
@@ -2149,25 +2202,48 @@ impl<P: Auv2Plugin> IOBuffers<P> {
         }
 
         let io_data = unsafe { io_data.as_ref() }.ok_or(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE)?;
-        if io_data.mNumberBuffers < output_channels as u32 {
-            return Err(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE);
-        }
         let Some(output_bus) = self.output_busses.get(bus_idx) else {
             return Err(K_AUDIO_UNIT_ERR_INVALID_ELEMENT);
         };
+        let buffers = unsafe { io_data.buffers() };
 
-        for channel_idx in 0..output_channels {
-            let buffer = &io_data.mBuffers[channel_idx];
-            if buffer.mData.is_null()
-                || buffer.mDataByteSize < (num_frames * mem::size_of::<f32>()) as u32
-            {
-                return Err(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE);
-            }
+        match io_data.mNumberBuffers as usize {
+            count if count >= output_channels => {
+                for channel_idx in 0..output_channels {
+                    let buffer = &buffers[channel_idx];
+                    if buffer.mData.is_null()
+                        || buffer.mDataByteSize < (num_frames * mem::size_of::<f32>()) as u32
+                    {
+                        return Err(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE);
+                    }
 
-            unsafe {
-                slice::from_raw_parts_mut(buffer.mData.cast::<f32>(), num_frames)
-                    .copy_from_slice(&output_bus.storage[channel_idx][..num_frames]);
+                    unsafe {
+                        slice::from_raw_parts_mut(buffer.mData.cast::<f32>(), num_frames)
+                            .copy_from_slice(&output_bus.storage[channel_idx][..num_frames]);
+                    }
+                }
             }
+            1 => {
+                let buffer = &buffers[0];
+                let required_size =
+                    (num_frames * output_channels * mem::size_of::<f32>()) as u32;
+                if buffer.mData.is_null()
+                    || buffer.mNumberChannels != output_channels as u32
+                    || buffer.mDataByteSize < required_size
+                {
+                    return Err(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE);
+                }
+
+                let interleaved =
+                    unsafe { slice::from_raw_parts_mut(buffer.mData.cast::<f32>(), num_frames * output_channels) };
+                for frame_idx in 0..num_frames {
+                    for channel_idx in 0..output_channels {
+                        interleaved[(frame_idx * output_channels) + channel_idx] =
+                            output_bus.storage[channel_idx][frame_idx];
+                    }
+                }
+            }
+            _ => return Err(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE),
         }
 
         Ok(())
@@ -2280,9 +2356,14 @@ impl FixedAudioBufferList {
 }
 
 unsafe extern "C" fn open<P: Auv2Plugin>(
-    _self_ptr: *mut c_void,
-    _instance: AudioComponentInstance,
+    self_ptr: *mut c_void,
+    instance: AudioComponentInstance,
 ) -> OSStatus {
+    if self_ptr.is_null() {
+        return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+    }
+
+    register_audio_unit_instance::<P>(self_ptr, instance);
     0
 }
 
@@ -2291,6 +2372,7 @@ unsafe extern "C" fn close<P: Auv2Plugin>(self_ptr: *mut c_void) -> OSStatus {
         return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
     }
 
+    unregister_audio_unit_instance::<P>(self_ptr);
     drop(unsafe { Arc::from_raw(self_ptr.cast::<Wrapper<P>>()) });
     0
 }
@@ -3104,6 +3186,45 @@ fn wrapper_from_raw<P: Auv2Plugin>(self_ptr: *mut c_void) -> &'static Wrapper<P>
     unsafe { &*(self_ptr.cast::<Wrapper<P>>()) }
 }
 
+fn audio_unit_instance_wrappers() -> &'static Mutex<HashMap<usize, usize>> {
+    AUDIO_UNIT_INSTANCE_WRAPPERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_audio_unit_instance<P: Auv2Plugin>(
+    self_ptr: *mut c_void,
+    instance: AudioComponentInstance,
+) {
+    if self_ptr.is_null() || instance.is_null() {
+        return;
+    }
+
+    let wrapper = wrapper_from_raw::<P>(self_ptr);
+    wrapper.component_instance.store(instance as usize);
+    audio_unit_instance_wrappers()
+        .lock()
+        .insert(instance as usize, self_ptr as usize);
+}
+
+fn unregister_audio_unit_instance<P: Auv2Plugin>(self_ptr: *mut c_void) {
+    if self_ptr.is_null() {
+        return;
+    }
+
+    let instance = wrapper_from_raw::<P>(self_ptr).component_instance.swap(0);
+    if instance != 0 {
+        audio_unit_instance_wrappers().lock().remove(&instance);
+    }
+}
+
+fn wrapper_from_audio_unit_instance<P: Auv2Plugin>(audio_unit: AudioUnit) -> Option<Arc<Wrapper<P>>> {
+    let self_ptr = audio_unit_instance_wrappers()
+        .lock()
+        .get(&(audio_unit as usize))
+        .copied()? as *const Wrapper<P>;
+
+    unsafe { clone_wrapper_arc_from_raw(self_ptr) }
+}
+
 unsafe fn clone_wrapper_arc_from_raw<P: Auv2Plugin>(
     self_ptr: *const Wrapper<P>,
 ) -> Option<Arc<Wrapper<P>>> {
@@ -3203,8 +3324,7 @@ extern "C" fn cocoa_ui_view_for_audio_unit<P: Auv2Plugin>(
     audio_unit: AudioUnit,
     preferred_size: NSSize,
 ) -> *mut Object {
-    let Some(wrapper) = (unsafe { clone_wrapper_arc_from_raw(audio_unit as *const Wrapper<P>) })
-    else {
+    let Some(wrapper) = wrapper_from_audio_unit_instance::<P>(audio_unit) else {
         return ptr::null_mut();
     };
 
@@ -3216,13 +3336,16 @@ extern "C" fn cocoa_ui_view_for_audio_unit<P: Auv2Plugin>(
         };
         let editor = editor_mutex.lock();
         let (default_width, default_height) = editor.size();
+
+        // Some hosts pass a tiny placeholder here. Until AUv2 resize requests are implemented, do
+        // not allow the host's preferred size to shrink the editor below its declared size.
         let width = if preferred_size.width > 0.0 {
-            preferred_size.width
+            preferred_size.width.max(default_width as f64)
         } else {
             default_width as f64
         };
         let height = if preferred_size.height > 0.0 {
-            preferred_size.height
+            preferred_size.height.max(default_height as f64)
         } else {
             default_height as f64
         };
@@ -3233,6 +3356,7 @@ extern "C" fn cocoa_ui_view_for_audio_unit<P: Auv2Plugin>(
         if view.is_null() {
             return ptr::null_mut();
         }
+        wrapper.cocoa_view.store(view as usize);
 
         let gui_context = wrapper.clone().make_gui_context();
         let editor_handle =
@@ -3241,6 +3365,7 @@ extern "C" fn cocoa_ui_view_for_audio_unit<P: Auv2Plugin>(
     };
     wrapper.open_editor_count.fetch_add(1, Ordering::Relaxed);
     let state = Box::new(CocoaViewState {
+        view,
         wrapper,
         _gui_context: gui_context,
         _editor_handle: editor_handle,
@@ -3334,6 +3459,25 @@ fn make_ns_rect(width: f64, height: f64) -> NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
         size: NSSize { width, height },
     }
+}
+
+unsafe fn resize_cocoa_view(view: *mut Object, width: f64, height: f64) -> bool {
+    if view.is_null() {
+        return false;
+    }
+
+    let size = NSSize { width, height };
+
+    unsafe {
+        let () = msg_send![view, setFrameSize: size];
+
+        let window: *mut Object = msg_send![view, window];
+        if !window.is_null() {
+            let () = msg_send![window, setContentSize: size];
+        }
+    }
+
+    true
 }
 
 fn make_stream_format(sample_rate: f64, channels: u32) -> AudioStreamBasicDescription {
