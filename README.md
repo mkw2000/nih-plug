@@ -106,6 +106,8 @@ For a list of available crate flags, see
     See the [egui-baseview](baseview-adapters/egui-baseview/) crate for prerequisites.
     - [nih_plug_iced](crates/nih_plug_iced) - Adapter for [Iced](https://iced.rs/).
     See the [iced_baseview](baseview-adapters/iced-baseview/) crate for prerequisites.
+    - [nih_plug_slint](crates/nih_plug_slint) - Adapter for [Slint](https://slint.dev/)
+    using baseview and Slint's FemtoVG renderer.
 - Full support for receiving and outputting both modern polyphonic note
   expression events as well as MIDI CCs, channel pressure, and pitch bend for
   CLAP and VST3.
@@ -184,6 +186,9 @@ examples.
     [egui-baseview](baseview-adapters/egui-baseview/) crate for prerequisites.
     - [**gain_iced**](examples/gain_iced) - See the
     [iced_baseview](baseview-adapters/iced-baseview/) crate for prerequisites.
+- [nih_plug_slint](crates/nih_plug_slint) provides a Slint editor adapter for
+  plugins that build their own Slint component instead of using one of the
+  bundled gain GUI examples.
 - Examples for adding your own custom GUI framework on top of raw rendering APIs:
   - [**byo_gui_gl**](examples/byo_gui_gl) - for rendering with OpenGL
   - [**byo_gui_wgpu**](examples/byo_gui_wgpu) - for rendering with [wgpu](wgpu.rs)

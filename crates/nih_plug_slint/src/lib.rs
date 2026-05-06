@@ -1,16 +1,16 @@
 // Adapted for this vendored NIH-plug fork from aidan729/nih-plug-slint (ISC).
 
 use baseview::{
-    gl::GlConfig, Event, Size, Window, WindowEvent as BaseviewWindowEvent, WindowHandle,
-    WindowInfo, WindowOpenOptions, WindowScalePolicy,
+    Event, Size, Window, WindowEvent as BaseviewWindowEvent, WindowHandle, WindowInfo,
+    WindowOpenOptions, WindowScalePolicy, gl::GlConfig,
 };
 use crossbeam::atomic::AtomicCell;
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::{Editor, GuiContext, ParamSetter};
 use once_cell::unsync::OnceCell;
-use slint::platform::femtovg_renderer::FemtoVGRenderer;
 use slint::platform::WindowAdapter;
 use slint::platform::WindowEvent;
+use slint::platform::femtovg_renderer::FemtoVGRenderer;
 use slint::{LogicalPosition, PhysicalSize, SharedString};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
@@ -98,7 +98,7 @@ impl SlintEditorState {
 /// ```rust,ignore
 /// fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
 ///     Some(Box::new(
-///         SlintEditor::new(self.params.editor_state.clone(), || gui::AppWindow::new(), (400, 300))
+///         SlintEditor::new(self.params.editor_state.clone(), || gui::AppWindow::new())
 ///             .with_event_loop({
 ///                 let params = self.params.clone();
 ///                 move |handler, _setter, _window| {
