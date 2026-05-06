@@ -8,6 +8,7 @@ members = [
   "crates/xtask",
   "crates/nih_plug_egui",
   "crates/nih_plug_iced",
+  "crates/nih_plug_slint",
 
   "baseview-adapters/egui-baseview",
   "baseview-adapters/iced-baseview",
