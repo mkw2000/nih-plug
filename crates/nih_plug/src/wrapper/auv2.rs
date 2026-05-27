@@ -5,6 +5,7 @@ use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use crossbeam::atomic::AtomicCell;
 use crossbeam::queue::ArrayQueue;
@@ -120,9 +121,14 @@ const K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_STRINGS: AudioUnitPropertyID = 16;
 const K_AUDIO_UNIT_PROPERTY_TAIL_TIME: AudioUnitPropertyID = 20;
 const K_AUDIO_UNIT_PROPERTY_BYPASS_EFFECT: AudioUnitPropertyID = 21;
 const K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK: AudioUnitPropertyID = 23;
+const K_AUDIO_UNIT_PROPERTY_CURRENT_PRESET: AudioUnitPropertyID = 28;
 const K_AUDIO_UNIT_PROPERTY_HOST_CALLBACKS: AudioUnitPropertyID = 27;
 const K_AUDIO_UNIT_PROPERTY_IN_PLACE_PROCESSING: AudioUnitPropertyID = 29;
 const K_AUDIO_UNIT_PROPERTY_COCOA_UI: AudioUnitPropertyID = 31;
+const K_AUDIO_UNIT_PROPERTY_PARAMETER_STRING_FROM_VALUE: AudioUnitPropertyID = 33;
+const K_AUDIO_UNIT_PROPERTY_PARAMETER_ID_NAME: AudioUnitPropertyID = 34;
+const K_AUDIO_UNIT_PROPERTY_PRESENT_PRESET: AudioUnitPropertyID = 36;
+const K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_FROM_STRING: AudioUnitPropertyID = 38;
 const K_AUDIO_UNIT_PROPERTY_MIDI_OUTPUT_CALLBACK_INFO: AudioUnitPropertyID = 47;
 const K_AUDIO_UNIT_PROPERTY_MIDI_OUTPUT_CALLBACK: AudioUnitPropertyID = 48;
 
@@ -133,9 +139,14 @@ const K_AUDIO_UNIT_GET_PROPERTY_SELECT: i16 = 0x0004;
 const K_AUDIO_UNIT_SET_PROPERTY_SELECT: i16 = 0x0005;
 const K_AUDIO_UNIT_GET_PARAMETER_SELECT: i16 = 0x0006;
 const K_AUDIO_UNIT_SET_PARAMETER_SELECT: i16 = 0x0007;
+const K_AUDIO_UNIT_ADD_PROPERTY_LISTENER_SELECT: i16 = 0x000A;
+const K_AUDIO_UNIT_REMOVE_PROPERTY_LISTENER_SELECT: i16 = 0x000B;
 const K_AUDIO_UNIT_RESET_SELECT: i16 = 0x0009;
 const K_AUDIO_UNIT_RENDER_SELECT: i16 = 0x000E;
+const K_AUDIO_UNIT_ADD_RENDER_NOTIFY_SELECT: i16 = 0x000F;
+const K_AUDIO_UNIT_REMOVE_RENDER_NOTIFY_SELECT: i16 = 0x0010;
 const K_AUDIO_UNIT_SCHEDULE_PARAMETERS_SELECT: i16 = 0x0011;
+const K_AUDIO_UNIT_REMOVE_PROPERTY_LISTENER_WITH_USER_DATA_SELECT: i16 = 0x0012;
 const K_MUSIC_DEVICE_MIDI_EVENT_SELECT: i16 = 0x0101;
 const K_MUSIC_DEVICE_SYS_EX_SELECT: i16 = 0x0102;
 
@@ -169,9 +180,11 @@ const K_AUDIO_UNIT_PARAMETER_UNIT_MILLISECONDS: AudioUnitParameterUnit = 24;
 
 const K_AUDIO_UNIT_PARAMETER_FLAG_VALUES_HAVE_STRINGS: AudioUnitParameterOptions = 1 << 21;
 const K_AUDIO_UNIT_PARAMETER_FLAG_CAN_RAMP: AudioUnitParameterOptions = 1 << 25;
+const K_AUDIO_UNIT_PARAMETER_FLAG_HAS_CF_NAME_STRING: AudioUnitParameterOptions = 1 << 27;
 const K_AUDIO_UNIT_PARAMETER_FLAG_IS_READABLE: AudioUnitParameterOptions = 1 << 30;
 const K_AUDIO_UNIT_PARAMETER_FLAG_IS_WRITABLE: AudioUnitParameterOptions = 1 << 31;
 const K_AUDIO_UNIT_PARAMETER_FLAG_GLOBAL: AudioUnitParameterOptions = 1 << 0;
+const K_AUDIO_UNIT_PARAMETER_FLAG_CF_NAME_RELEASE: AudioUnitParameterOptions = 1 << 4;
 const K_AUDIO_UNIT_EVENT_BEGIN_PARAMETER_CHANGE_GESTURE: u32 = 1;
 const K_AUDIO_UNIT_EVENT_END_PARAMETER_CHANGE_GESTURE: u32 = 2;
 
@@ -179,6 +192,8 @@ const CLASS_INFO_VERSION_KEY: &str = "version";
 const CLASS_INFO_TYPE_KEY: &str = "type";
 const CLASS_INFO_SUBTYPE_KEY: &str = "subtype";
 const CLASS_INFO_MANUFACTURER_KEY: &str = "manufacturer";
+const CLASS_INFO_NAME_KEY: &str = "name";
+const CLASS_INFO_PRESET_NUMBER_KEY: &str = "preset-number";
 const CLASS_INFO_DATA_KEY: &str = "data";
 pub const NIH_AUV2_FACTORY_SYMBOL: &str = "NihAudioUnitFactory";
 pub const NIH_AUV2_METADATA_SYMBOL: &str = "NihAudioUnitBundlerMetadata";
@@ -203,6 +218,13 @@ type AudioUnitParameterOptions = u32;
 type AudioComponentMethod = *const c_void;
 type Boolean = u8;
 type CFURLRef = *const c_void;
+type AudioUnitPropertyListenerProc = unsafe extern "C" fn(
+    *mut c_void,
+    AudioUnit,
+    AudioUnitPropertyID,
+    AudioUnitScope,
+    AudioUnitElement,
+);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -237,12 +259,6 @@ pub struct AudioBuffer {
 pub struct AudioBufferList {
     pub mNumberBuffers: u32,
     pub mBuffers: [AudioBuffer; 1],
-}
-
-impl AudioBufferList {
-    unsafe fn buffers(&self) -> &[AudioBuffer] {
-        unsafe { slice::from_raw_parts(self.mBuffers.as_ptr(), self.mNumberBuffers as usize) }
-    }
 }
 
 #[repr(C)]
@@ -322,6 +338,13 @@ pub type AURenderCallback = unsafe extern "C" fn(
     *mut AudioBufferList,
 ) -> OSStatus;
 
+#[derive(Clone, Copy)]
+struct PropertyListener {
+    property_id: AudioUnitPropertyID,
+    proc: AudioUnitPropertyListenerProc,
+    user_data: usize,
+}
+
 pub type HostCallbackGetBeatAndTempo =
     unsafe extern "C" fn(*mut c_void, *mut f64, *mut f64) -> OSStatus;
 pub type HostCallbackGetMusicalTimeLocation =
@@ -371,6 +394,33 @@ pub struct AudioUnitParameterInfo {
     pub maxValue: AudioUnitParameterValue,
     pub defaultValue: AudioUnitParameterValue,
     pub flags: AudioUnitParameterOptions,
+}
+
+#[repr(C)]
+pub struct AUPreset {
+    pub presetNumber: i32,
+    pub presetName: CFStringRef,
+}
+
+#[repr(C)]
+pub struct AudioUnitParameterStringFromValue {
+    pub inParamID: AudioUnitParameterID,
+    pub inValue: *const AudioUnitParameterValue,
+    pub outString: CFStringRef,
+}
+
+#[repr(C)]
+pub struct AudioUnitParameterValueFromString {
+    pub inParamID: AudioUnitParameterID,
+    pub inString: CFStringRef,
+    pub outValue: AudioUnitParameterValue,
+}
+
+#[repr(C)]
+pub struct AudioUnitParameterIDName {
+    pub inID: AudioUnitParameterID,
+    pub inDesiredLength: i32,
+    pub outName: CFStringRef,
 }
 
 #[repr(C)]
@@ -689,6 +739,7 @@ pub struct Wrapper<P: Auv2Plugin> {
     host_callbacks: AtomicCell<Option<HostCallbackInfo>>,
     midi_output_callback: AtomicCell<Option<AUMIDIOutputCallbackStruct>>,
     in_place_processing: AtomicBool,
+    property_listeners: Mutex<Vec<PropertyListener>>,
 
     buffer_manager: AtomicRefCell<BufferManager>,
     io_buffers: AtomicRefCell<IOBuffers<P>>,
@@ -803,6 +854,7 @@ impl<P: Auv2Plugin> Wrapper<P> {
             host_callbacks: AtomicCell::new(None),
             midi_output_callback: AtomicCell::new(None),
             in_place_processing: AtomicBool::new(Self::can_process_in_place(initial_audio_io_layout)),
+            property_listeners: Mutex::new(Vec::new()),
 
             buffer_manager: AtomicRefCell::new(BufferManager::for_audio_io_layout(
                 0,
@@ -996,12 +1048,14 @@ impl<P: Auv2Plugin> Wrapper<P> {
         counts
     }
 
-    fn can_process_in_place(layout: AudioIOLayout) -> bool {
-        let input_channels = Self::bus_channel_counts_for_layout(layout, K_AUDIO_UNIT_SCOPE_INPUT);
-        let output_channels =
-            Self::bus_channel_counts_for_layout(layout, K_AUDIO_UNIT_SCOPE_OUTPUT);
-
-        !input_channels.is_empty() && input_channels == output_channels
+    fn can_process_in_place(_layout: AudioIOLayout) -> bool {
+        // This wrapper renders through internal bus storage and copies into the
+        // host's output buffers after processing. If the AU reports in-place
+        // support, hosts such as auval may legally provide a null output buffer
+        // and expect the input buffer to hold the rendered output. The wrapper
+        // does not currently implement that code path, so advertise out-of-place
+        // processing only.
+        false
     }
 
     fn match_audio_io_layout_by_busses(
@@ -1017,6 +1071,37 @@ impl<P: Auv2Plugin> Wrapper<P> {
                     == input_channels
                     && Self::bus_channel_counts_for_layout(*layout, K_AUDIO_UNIT_SCOPE_OUTPUT)
                         == output_channels
+            })
+    }
+
+    fn match_audio_io_layout_for_stream_format(
+        &self,
+        scope: AudioUnitScope,
+        input_channels: &[u32],
+        output_channels: &[u32],
+    ) -> Option<AudioIOLayout> {
+        if let Some(layout) = self.match_audio_io_layout_by_busses(input_channels, output_channels) {
+            return Some(layout);
+        }
+
+        // Hosts change input and output stream formats independently. Accept the
+        // side that was just changed and move the other side to a compatible
+        // supported layout instead of rejecting transient unsupported pairs such
+        // as 2-in/1-out while the host is moving from mono to stereo.
+        self.supported_audio_io_layouts
+            .iter()
+            .copied()
+            .find(|layout| {
+                let layout_input =
+                    Self::bus_channel_counts_for_layout(*layout, K_AUDIO_UNIT_SCOPE_INPUT);
+                let layout_output =
+                    Self::bus_channel_counts_for_layout(*layout, K_AUDIO_UNIT_SCOPE_OUTPUT);
+
+                match scope {
+                    K_AUDIO_UNIT_SCOPE_INPUT => layout_input == input_channels,
+                    K_AUDIO_UNIT_SCOPE_OUTPUT => layout_output == output_channels,
+                    _ => false,
+                }
             })
     }
 
@@ -1059,6 +1144,34 @@ impl<P: Auv2Plugin> Wrapper<P> {
             .as_ref()
             .expect("Missing event loop")
             .schedule_gui(task)
+    }
+
+    fn notify_property_listeners(
+        &self,
+        property_id: AudioUnitPropertyID,
+        scope: AudioUnitScope,
+        element: AudioUnitElement,
+    ) {
+        let listeners: Vec<_> = self
+            .property_listeners
+            .lock()
+            .iter()
+            .copied()
+            .filter(|listener| listener.property_id == property_id)
+            .collect();
+        let instance = self.component_instance.load() as AudioUnit;
+
+        for listener in listeners {
+            unsafe {
+                (listener.proc)(
+                    listener.user_data as *mut c_void,
+                    instance,
+                    property_id,
+                    scope,
+                    element,
+                );
+            }
+        }
     }
 
     fn set_latency_samples(&self, samples: u32) {
@@ -1132,7 +1245,8 @@ impl<P: Auv2Plugin> Wrapper<P> {
             }
             _ => return K_AUDIO_UNIT_ERR_INVALID_SCOPE,
         };
-        let new_layout = self.match_audio_io_layout_by_busses(&input_channels, &output_channels);
+        let new_layout =
+            self.match_audio_io_layout_for_stream_format(scope, &input_channels, &output_channels);
 
         match new_layout {
             Some(layout) => {
@@ -1260,6 +1374,18 @@ impl<P: Auv2Plugin> Wrapper<P> {
         }
     }
 
+    fn restore_defaults(&self) {
+        for param_ptr in self.param_by_hash.values() {
+            let default_normalized = unsafe { param_ptr.default_normalized_value() };
+            unsafe { param_ptr.set_normalized_value(default_normalized) };
+            if let Some(buffer_config) = self.current_buffer_config.load() {
+                unsafe { param_ptr.update_smoother(buffer_config.sample_rate, true) };
+            }
+        }
+        let task_posted = self.schedule_gui(Task::ParameterValuesChanged);
+        nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
+    }
+
     fn push_parameter_change(&self, param_hash: u32, sample_offset: u32, normalized_value: f32) {
         let result = self.pending_parameter_changes.push(ScheduledParameterChange {
             param_hash,
@@ -1311,10 +1437,7 @@ impl<P: Auv2Plugin> Wrapper<P> {
     }
 
     fn queue_parameter_event(&self, event: &AudioUnitParameterEvent) -> OSStatus {
-        if !matches!(
-            event.scope,
-            K_AUDIO_UNIT_SCOPE_GLOBAL | K_AUDIO_UNIT_SCOPE_INPUT | K_AUDIO_UNIT_SCOPE_OUTPUT
-        ) {
+        if event.scope != K_AUDIO_UNIT_SCOPE_GLOBAL {
             return K_AUDIO_UNIT_ERR_INVALID_SCOPE;
         }
 
@@ -2201,19 +2324,30 @@ impl<P: Auv2Plugin> IOBuffers<P> {
             return Err(K_AUDIO_UNIT_ERR_INVALID_ELEMENT);
         }
 
-        let io_data = unsafe { io_data.as_ref() }.ok_or(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE)?;
+        let io_data = unsafe { io_data.as_mut() }.ok_or(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE)?;
         let Some(output_bus) = self.output_busses.get(bus_idx) else {
             return Err(K_AUDIO_UNIT_ERR_INVALID_ELEMENT);
         };
-        let buffers = unsafe { io_data.buffers() };
+        let buffers = unsafe {
+            slice::from_raw_parts_mut(
+                io_data.mBuffers.as_mut_ptr(),
+                io_data.mNumberBuffers as usize,
+            )
+        };
 
         match io_data.mNumberBuffers as usize {
             count if count >= output_channels => {
                 for channel_idx in 0..output_channels {
-                    let buffer = &buffers[channel_idx];
-                    if buffer.mData.is_null()
-                        || buffer.mDataByteSize < (num_frames * mem::size_of::<f32>()) as u32
-                    {
+                    let buffer = &mut buffers[channel_idx];
+                    let required_size = (num_frames * mem::size_of::<f32>()) as u32;
+                    if buffer.mData.is_null() {
+                        buffer.mNumberChannels = 1;
+                        buffer.mDataByteSize = required_size;
+                        buffer.mData = output_bus.storage[channel_idx].as_ptr() as *mut c_void;
+                        continue;
+                    }
+
+                    if buffer.mDataByteSize < required_size {
                         return Err(K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE);
                     }
 
@@ -2224,7 +2358,7 @@ impl<P: Auv2Plugin> IOBuffers<P> {
                 }
             }
             1 => {
-                let buffer = &buffers[0];
+                let buffer = &mut buffers[0];
                 let required_size =
                     (num_frames * output_channels * mem::size_of::<f32>()) as u32;
                 if buffer.mData.is_null()
@@ -2386,6 +2520,19 @@ unsafe extern "C" fn lookup<P: Auv2Plugin>(selector: i16) -> AudioComponentMetho
         K_AUDIO_UNIT_SET_PROPERTY_SELECT => set_property::<P> as AudioComponentMethod,
         K_AUDIO_UNIT_GET_PARAMETER_SELECT => get_parameter::<P> as AudioComponentMethod,
         K_AUDIO_UNIT_SET_PARAMETER_SELECT => set_parameter::<P> as AudioComponentMethod,
+        K_AUDIO_UNIT_ADD_PROPERTY_LISTENER_SELECT => {
+            add_property_listener::<P> as AudioComponentMethod
+        }
+        K_AUDIO_UNIT_REMOVE_PROPERTY_LISTENER_SELECT => {
+            remove_property_listener::<P> as AudioComponentMethod
+        }
+        K_AUDIO_UNIT_REMOVE_PROPERTY_LISTENER_WITH_USER_DATA_SELECT => {
+            remove_property_listener_with_user_data::<P> as AudioComponentMethod
+        }
+        K_AUDIO_UNIT_ADD_RENDER_NOTIFY_SELECT => add_render_notify::<P> as AudioComponentMethod,
+        K_AUDIO_UNIT_REMOVE_RENDER_NOTIFY_SELECT => {
+            remove_render_notify::<P> as AudioComponentMethod
+        }
         K_AUDIO_UNIT_SCHEDULE_PARAMETERS_SELECT => {
             schedule_parameters::<P> as AudioComponentMethod
         }
@@ -2395,6 +2542,88 @@ unsafe extern "C" fn lookup<P: Auv2Plugin>(selector: i16) -> AudioComponentMetho
         K_MUSIC_DEVICE_SYS_EX_SELECT => music_device_sysex::<P> as AudioComponentMethod,
         _ => ptr::null(),
     }
+}
+
+unsafe extern "C" fn add_property_listener<P: Auv2Plugin>(
+    self_ptr: *mut c_void,
+    property_id: AudioUnitPropertyID,
+    listener: Option<AudioUnitPropertyListenerProc>,
+    user_data: *mut c_void,
+) -> OSStatus {
+    let Some(proc) = listener else {
+        return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+    };
+
+    wrapper_from_raw::<P>(self_ptr)
+        .property_listeners
+        .lock()
+        .push(PropertyListener {
+            property_id,
+            proc,
+            user_data: user_data as usize,
+        });
+
+    0
+}
+
+unsafe extern "C" fn remove_property_listener<P: Auv2Plugin>(
+    self_ptr: *mut c_void,
+    property_id: AudioUnitPropertyID,
+    listener: Option<AudioUnitPropertyListenerProc>,
+) -> OSStatus {
+    let Some(proc) = listener else {
+        return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+    };
+    let proc_addr = proc as usize;
+
+    wrapper_from_raw::<P>(self_ptr)
+        .property_listeners
+        .lock()
+        .retain(|listener| {
+            listener.property_id != property_id || listener.proc as usize != proc_addr
+        });
+
+    0
+}
+
+unsafe extern "C" fn remove_property_listener_with_user_data<P: Auv2Plugin>(
+    self_ptr: *mut c_void,
+    property_id: AudioUnitPropertyID,
+    listener: Option<AudioUnitPropertyListenerProc>,
+    user_data: *mut c_void,
+) -> OSStatus {
+    let Some(proc) = listener else {
+        return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+    };
+    let proc_addr = proc as usize;
+    let user_data = user_data as usize;
+
+    wrapper_from_raw::<P>(self_ptr)
+        .property_listeners
+        .lock()
+        .retain(|listener| {
+            listener.property_id != property_id
+                || listener.proc as usize != proc_addr
+                || listener.user_data != user_data
+        });
+
+    0
+}
+
+unsafe extern "C" fn add_render_notify<P: Auv2Plugin>(
+    _self_ptr: *mut c_void,
+    _callback: Option<AURenderCallback>,
+    _user_data: *mut c_void,
+) -> OSStatus {
+    0
+}
+
+unsafe extern "C" fn remove_render_notify<P: Auv2Plugin>(
+    _self_ptr: *mut c_void,
+    _callback: Option<AURenderCallback>,
+    _user_data: *mut c_void,
+) -> OSStatus {
+    0
 }
 
 unsafe extern "C" fn initialize<P: Auv2Plugin>(self_ptr: *mut c_void) -> OSStatus {
@@ -2425,18 +2654,12 @@ unsafe extern "C" fn get_property_info<P: Auv2Plugin>(
             mem::size_of::<f64>() as u32
         }
         K_AUDIO_UNIT_PROPERTY_PARAMETER_LIST
-            if matches!(
-                scope,
-                K_AUDIO_UNIT_SCOPE_GLOBAL | K_AUDIO_UNIT_SCOPE_INPUT | K_AUDIO_UNIT_SCOPE_OUTPUT
-            ) =>
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
         {
             (wrapper.param_hashes.len() * mem::size_of::<AudioUnitParameterID>()) as u32
         }
         K_AUDIO_UNIT_PROPERTY_PARAMETER_INFO
-            if matches!(
-                scope,
-                K_AUDIO_UNIT_SCOPE_GLOBAL | K_AUDIO_UNIT_SCOPE_INPUT | K_AUDIO_UNIT_SCOPE_OUTPUT
-            ) && wrapper.param_by_hash.contains_key(&element) =>
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && wrapper.param_by_hash.contains_key(&element) =>
         {
             mem::size_of::<AudioUnitParameterInfo>() as u32
         }
@@ -2468,10 +2691,7 @@ unsafe extern "C" fn get_property_info<P: Auv2Plugin>(
             mem::size_of::<u32>() as u32
         }
         K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_STRINGS
-            if matches!(
-                scope,
-                K_AUDIO_UNIT_SCOPE_GLOBAL | K_AUDIO_UNIT_SCOPE_INPUT | K_AUDIO_UNIT_SCOPE_OUTPUT
-            ) && wrapper
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && wrapper
                 .param_by_hash
                 .get(&element)
                 .is_some_and(|param| unsafe { param.step_count() }.is_some()) =>
@@ -2513,6 +2733,31 @@ unsafe extern "C" fn get_property_info<P: Auv2Plugin>(
         {
             mem::size_of::<AudioUnitCocoaViewInfo>() as u32
         }
+        K_AUDIO_UNIT_PROPERTY_CURRENT_PRESET
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && element == 0 =>
+        {
+            mem::size_of::<AUPreset>() as u32
+        }
+        K_AUDIO_UNIT_PROPERTY_PRESENT_PRESET
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && element == 0 =>
+        {
+            mem::size_of::<AUPreset>() as u32
+        }
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_STRING_FROM_VALUE
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
+        {
+            mem::size_of::<AudioUnitParameterStringFromValue>() as u32
+        }
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_FROM_STRING
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
+        {
+            mem::size_of::<AudioUnitParameterValueFromString>() as u32
+        }
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_ID_NAME
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && wrapper.param_by_hash.contains_key(&element) =>
+        {
+            mem::size_of::<AudioUnitParameterIDName>() as u32
+        }
         K_AUDIO_UNIT_PROPERTY_MIDI_OUTPUT_CALLBACK_INFO
             if scope == K_AUDIO_UNIT_SCOPE_GLOBAL
                 && element == 0
@@ -2529,6 +2774,11 @@ unsafe extern "C" fn get_property_info<P: Auv2Plugin>(
         }
         K_AUDIO_UNIT_PROPERTY_PARAMETER_INFO => return K_AUDIO_UNIT_ERR_INVALID_PARAMETER,
         K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_STRINGS => return K_AUDIO_UNIT_ERR_INVALID_PARAMETER,
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_STRING_FROM_VALUE => return K_AUDIO_UNIT_ERR_INVALID_PARAMETER,
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_FROM_STRING => return K_AUDIO_UNIT_ERR_INVALID_PARAMETER,
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_ID_NAME => return K_AUDIO_UNIT_ERR_INVALID_PARAMETER,
+        K_AUDIO_UNIT_PROPERTY_CURRENT_PRESET => return K_AUDIO_UNIT_ERR_INVALID_PROPERTY,
+        K_AUDIO_UNIT_PROPERTY_PRESENT_PRESET => return K_AUDIO_UNIT_ERR_INVALID_PROPERTY,
         _ => return K_AUDIO_UNIT_ERR_INVALID_PROPERTY,
     };
 
@@ -2546,7 +2796,12 @@ unsafe extern "C" fn get_property_info<P: Auv2Plugin>(
                 | K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_STRINGS
                 | K_AUDIO_UNIT_PROPERTY_TAIL_TIME
                 | K_AUDIO_UNIT_PROPERTY_COCOA_UI
-                | K_AUDIO_UNIT_PROPERTY_MIDI_OUTPUT_CALLBACK_INFO => 0,
+                | K_AUDIO_UNIT_PROPERTY_MIDI_OUTPUT_CALLBACK_INFO
+                | K_AUDIO_UNIT_PROPERTY_PARAMETER_STRING_FROM_VALUE
+                | K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_FROM_STRING
+                | K_AUDIO_UNIT_PROPERTY_PARAMETER_ID_NAME
+                | K_AUDIO_UNIT_PROPERTY_CURRENT_PRESET
+                | K_AUDIO_UNIT_PROPERTY_PRESENT_PRESET => 0,
                 _ => 1,
             };
         }
@@ -2597,10 +2852,7 @@ unsafe extern "C" fn get_property<P: Auv2Plugin>(
             0
         }
         K_AUDIO_UNIT_PROPERTY_PARAMETER_LIST
-            if matches!(
-                scope,
-                K_AUDIO_UNIT_SCOPE_GLOBAL | K_AUDIO_UNIT_SCOPE_INPUT | K_AUDIO_UNIT_SCOPE_OUTPUT
-            ) =>
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
         {
             unsafe {
                 ptr::copy_nonoverlapping(
@@ -2617,10 +2869,7 @@ unsafe extern "C" fn get_property<P: Auv2Plugin>(
             0
         }
         K_AUDIO_UNIT_PROPERTY_PARAMETER_INFO
-            if matches!(
-                scope,
-                K_AUDIO_UNIT_SCOPE_GLOBAL | K_AUDIO_UNIT_SCOPE_INPUT | K_AUDIO_UNIT_SCOPE_OUTPUT
-            ) =>
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
         {
             let Some(param_ptr) = wrapper.param_by_hash.get(&element).copied() else {
                 return K_AUDIO_UNIT_ERR_INVALID_PARAMETER;
@@ -2709,10 +2958,7 @@ unsafe extern "C" fn get_property<P: Auv2Plugin>(
             0
         }
         K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_STRINGS
-            if matches!(
-                scope,
-                K_AUDIO_UNIT_SCOPE_GLOBAL | K_AUDIO_UNIT_SCOPE_INPUT | K_AUDIO_UNIT_SCOPE_OUTPUT
-            ) =>
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
         {
             let Some(param_ptr) = wrapper.param_by_hash.get(&element).copied() else {
                 return K_AUDIO_UNIT_ERR_INVALID_PARAMETER;
@@ -2844,6 +3090,120 @@ unsafe extern "C" fn get_property<P: Auv2Plugin>(
             }
             0
         }
+        K_AUDIO_UNIT_PROPERTY_CURRENT_PRESET
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && element == 0 =>
+        {
+            let preset_name = CFString::new("Default");
+            let preset = AUPreset {
+                presetNumber: 0,
+                presetName: preset_name.as_concrete_TypeRef(),
+            };
+            mem::forget(preset_name);
+
+            unsafe {
+                *(out_data as *mut AUPreset) = preset;
+                if let Some(io_data_size) = io_data_size.as_mut() {
+                    *io_data_size = mem::size_of::<AUPreset>() as u32;
+                }
+            }
+            0
+        }
+        K_AUDIO_UNIT_PROPERTY_PRESENT_PRESET
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && element == 0 =>
+        {
+            let preset_name = CFString::new("Default");
+            let preset = AUPreset {
+                presetNumber: 0,
+                presetName: preset_name.as_concrete_TypeRef(),
+            };
+            mem::forget(preset_name);
+
+            unsafe {
+                *(out_data as *mut AUPreset) = preset;
+                if let Some(io_data_size) = io_data_size.as_mut() {
+                    *io_data_size = mem::size_of::<AUPreset>() as u32;
+                }
+            }
+            0
+        }
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_STRING_FROM_VALUE
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
+        {
+            if out_data.is_null() || io_data_size.is_null() {
+                return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+            }
+            let query = unsafe { &mut *(out_data as *mut AudioUnitParameterStringFromValue) };
+            let Some(param_ptr) = wrapper.param_by_hash.get(&query.inParamID).copied() else {
+                return K_AUDIO_UNIT_ERR_INVALID_PARAMETER;
+            };
+            let value = if query.inValue.is_null() {
+                unsafe { param_ptr.modulated_normalized_value() }
+            } else {
+                unsafe { *query.inValue }
+            };
+            let string = CFString::new(&unsafe {
+                param_ptr.normalized_value_to_string(value, !param_ptr.step_count().is_some())
+            });
+            query.outString = string.as_concrete_TypeRef();
+            mem::forget(string);
+
+            unsafe {
+                if let Some(io_data_size) = io_data_size.as_mut() {
+                    *io_data_size = mem::size_of::<AudioUnitParameterStringFromValue>() as u32;
+                }
+            }
+            0
+        }
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_VALUE_FROM_STRING
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
+        {
+            if out_data.is_null() || io_data_size.is_null() {
+                return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+            }
+            let query = unsafe { &mut *(out_data as *mut AudioUnitParameterValueFromString) };
+            let Some(param_ptr) = wrapper.param_by_hash.get(&query.inParamID).copied() else {
+                return K_AUDIO_UNIT_ERR_INVALID_PARAMETER;
+            };
+            let string = unsafe { CFString::wrap_under_get_rule(query.inString) };
+            let rust_string = string.to_string();
+            let Some(normalized) = (unsafe { param_ptr.string_to_normalized_value(&rust_string) }) else {
+                return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+            };
+            let plain_value = unsafe { param_ptr.preview_plain(normalized) };
+            query.outValue = plain_value;
+
+            unsafe {
+                if let Some(io_data_size) = io_data_size.as_mut() {
+                    *io_data_size = mem::size_of::<AudioUnitParameterValueFromString>() as u32;
+                }
+            }
+            0
+        }
+        K_AUDIO_UNIT_PROPERTY_PARAMETER_ID_NAME
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL =>
+        {
+            let Some(param_ptr) = wrapper.param_by_hash.get(&element).copied() else {
+                return K_AUDIO_UNIT_ERR_INVALID_PARAMETER;
+            };
+            let name_info = unsafe { &mut *(out_data as *mut AudioUnitParameterIDName) };
+            let param_name = unsafe { param_ptr.name() };
+            let desired_length = name_info.inDesiredLength;
+            let truncated_name = if desired_length >= 0 && (param_name.len() as i32) > desired_length {
+                &param_name[..desired_length as usize]
+            } else {
+                param_name
+            };
+            let cf_name = CFString::new(truncated_name);
+            name_info.outName = cf_name.as_concrete_TypeRef();
+            mem::forget(cf_name);
+
+            unsafe {
+                if let Some(io_data_size) = io_data_size.as_mut() {
+                    *io_data_size = mem::size_of::<AudioUnitParameterIDName>() as u32;
+                }
+            }
+            0
+        }
         K_AUDIO_UNIT_PROPERTY_MIDI_OUTPUT_CALLBACK_INFO
             if scope == K_AUDIO_UNIT_SCOPE_GLOBAL
                 && element == 0
@@ -2960,9 +3320,17 @@ unsafe extern "C" fn set_property<P: Auv2Plugin>(
                 return K_AUDIO_UNIT_ERR_INITIALIZED;
             }
 
-            wrapper
+            let maximum_frames = unsafe { *(in_data as *const u32) };
+            let previous = wrapper
                 .maximum_frames_per_slice
-                .store(unsafe { *(in_data as *const u32) }, Ordering::Relaxed);
+                .swap(maximum_frames, Ordering::Relaxed);
+            if previous != maximum_frames {
+                wrapper.notify_property_listeners(
+                    K_AUDIO_UNIT_PROPERTY_MAXIMUM_FRAMES_PER_SLICE,
+                    scope,
+                    element,
+                );
+            }
             0
         }
         K_AUDIO_UNIT_PROPERTY_BYPASS_EFFECT
@@ -2996,7 +3364,8 @@ unsafe extern "C" fn set_property<P: Auv2Plugin>(
             let Some(callback) = wrapper.input_callbacks.get(element as usize) else {
                 return K_AUDIO_UNIT_ERR_INVALID_ELEMENT;
             };
-            callback.store(Some(unsafe { *(in_data as *const AURenderCallbackStruct) }));
+            let callback_value = unsafe { *(in_data as *const AURenderCallbackStruct) };
+            callback.store(callback_value.inputProc.map(|_| callback_value));
             0
         }
         K_AUDIO_UNIT_PROPERTY_MAKE_CONNECTION
@@ -3008,7 +3377,8 @@ unsafe extern "C" fn set_property<P: Auv2Plugin>(
             let Some(connection) = wrapper.input_connections.get(element as usize) else {
                 return K_AUDIO_UNIT_ERR_INVALID_ELEMENT;
             };
-            connection.store(Some(unsafe { *(in_data as *const AudioUnitConnection) }));
+            let connection_value = unsafe { *(in_data as *const AudioUnitConnection) };
+            connection.store((!connection_value.sourceAudioUnit.is_null()).then_some(connection_value));
             0
         }
         K_AUDIO_UNIT_PROPERTY_HOST_CALLBACKS
@@ -3028,9 +3398,7 @@ unsafe extern "C" fn set_property<P: Auv2Plugin>(
             if in_data.is_null() || in_data_size != mem::size_of::<u32>() as u32 {
                 return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
             }
-            wrapper
-                .in_place_processing
-                .store(unsafe { *(in_data as *const u32) } != 0, Ordering::Relaxed);
+            wrapper.in_place_processing.store(false, Ordering::Relaxed);
             0
         }
         K_AUDIO_UNIT_PROPERTY_MIDI_OUTPUT_CALLBACK
@@ -3048,6 +3416,24 @@ unsafe extern "C" fn set_property<P: Auv2Plugin>(
                 .store(Some(unsafe { *(in_data as *const AUMIDIOutputCallbackStruct) }));
             0
         }
+        K_AUDIO_UNIT_PROPERTY_PRESENT_PRESET
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && element == 0 =>
+        {
+            if in_data.is_null() || in_data_size != mem::size_of::<AUPreset>() as u32 {
+                return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+            }
+            wrapper.restore_defaults();
+            0
+        }
+        K_AUDIO_UNIT_PROPERTY_CURRENT_PRESET
+            if scope == K_AUDIO_UNIT_SCOPE_GLOBAL && element == 0 =>
+        {
+            if in_data.is_null() || in_data_size != mem::size_of::<AUPreset>() as u32 {
+                return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+            }
+            wrapper.restore_defaults();
+            0
+        }
         _ => K_AUDIO_UNIT_ERR_PROPERTY_NOT_WRITABLE,
     }
 }
@@ -3055,12 +3441,15 @@ unsafe extern "C" fn set_property<P: Auv2Plugin>(
 unsafe extern "C" fn get_parameter<P: Auv2Plugin>(
     self_ptr: *mut c_void,
     param_id: AudioUnitParameterID,
-    _scope: AudioUnitScope,
-    _element: AudioUnitElement,
+    scope: AudioUnitScope,
+    element: AudioUnitElement,
     out_value: *mut AudioUnitParameterValue,
 ) -> OSStatus {
     if out_value.is_null() {
         return K_AUDIO_UNIT_ERR_INVALID_PROPERTY_VALUE;
+    }
+    if scope != K_AUDIO_UNIT_SCOPE_GLOBAL || element != 0 {
+        return K_AUDIO_UNIT_ERR_INVALID_SCOPE;
     }
 
     let wrapper = wrapper_from_raw::<P>(self_ptr);
@@ -3077,11 +3466,15 @@ unsafe extern "C" fn get_parameter<P: Auv2Plugin>(
 unsafe extern "C" fn set_parameter<P: Auv2Plugin>(
     self_ptr: *mut c_void,
     param_id: AudioUnitParameterID,
-    _scope: AudioUnitScope,
-    _element: AudioUnitElement,
+    scope: AudioUnitScope,
+    element: AudioUnitElement,
     in_value: AudioUnitParameterValue,
     in_buffer_offset_in_frames: u32,
 ) -> OSStatus {
+    if scope != K_AUDIO_UNIT_SCOPE_GLOBAL || element != 0 {
+        return K_AUDIO_UNIT_ERR_INVALID_SCOPE;
+    }
+
     wrapper_from_raw::<P>(self_ptr).set_plain_parameter(
         param_id,
         in_value,
@@ -3509,20 +3902,25 @@ fn stream_format_is_supported(stream_format: &AudioStreamBasicDescription) -> bo
 fn parameter_info(param_ptr: ParamPtr) -> AudioUnitParameterInfo {
     let flags = unsafe { param_ptr.flags() };
     let unit_string = unsafe { param_ptr.unit() }.trim();
+    let param_name = unsafe { param_ptr.name() };
+    let cf_name = CFString::new(param_name);
     let mut info = AudioUnitParameterInfo {
         name: [0; 52],
         unitName: ptr::null_mut(),
         clumpID: 0,
-        cfNameString: ptr::null_mut(),
+        cfNameString: cf_name.as_concrete_TypeRef(),
         unit: parameter_unit(param_ptr),
         minValue: unsafe { param_ptr.preview_plain(0.0) },
         maxValue: unsafe { param_ptr.preview_plain(1.0) },
         defaultValue: unsafe { param_ptr.default_plain_value() },
         flags: K_AUDIO_UNIT_PARAMETER_FLAG_GLOBAL
             | K_AUDIO_UNIT_PARAMETER_FLAG_IS_READABLE
-            | K_AUDIO_UNIT_PARAMETER_FLAG_IS_WRITABLE,
+            | K_AUDIO_UNIT_PARAMETER_FLAG_IS_WRITABLE
+            | K_AUDIO_UNIT_PARAMETER_FLAG_HAS_CF_NAME_STRING
+            | K_AUDIO_UNIT_PARAMETER_FLAG_CF_NAME_RELEASE,
     };
-    strlcpy(&mut info.name, unsafe { param_ptr.name() });
+    strlcpy(&mut info.name, param_name);
+    mem::forget(cf_name);
 
     if unsafe { param_ptr.step_count() }.is_some() {
         info.flags |= K_AUDIO_UNIT_PARAMETER_FLAG_VALUES_HAVE_STRINGS;
@@ -3562,12 +3960,16 @@ fn class_info_dictionary<P: Auv2Plugin>(serialized_state: &[u8]) -> CFDictionary
     let type_key = CFString::from_static_string(CLASS_INFO_TYPE_KEY);
     let subtype_key = CFString::from_static_string(CLASS_INFO_SUBTYPE_KEY);
     let manufacturer_key = CFString::from_static_string(CLASS_INFO_MANUFACTURER_KEY);
+    let name_key = CFString::from_static_string(CLASS_INFO_NAME_KEY);
+    let preset_number_key = CFString::from_static_string(CLASS_INFO_PRESET_NUMBER_KEY);
     let data_key = CFString::from_static_string(CLASS_INFO_DATA_KEY);
 
-    let version = CFString::new(P::VERSION);
-    let type_code = CFString::new(&String::from_utf8_lossy(&P::AUV2_TYPE));
-    let subtype_code = CFString::new(&String::from_utf8_lossy(&P::AUV2_SUBTYPE));
-    let manufacturer_code = CFString::new(&String::from_utf8_lossy(&P::AUV2_MANUFACTURER));
+    let version = CFNumber::from(parse_auv2_version(P::VERSION) as i32);
+    let type_code = CFNumber::from(fourcc(P::AUV2_TYPE) as i32);
+    let subtype_code = CFNumber::from(fourcc(P::AUV2_SUBTYPE) as i32);
+    let manufacturer_code = CFNumber::from(fourcc(P::AUV2_MANUFACTURER) as i32);
+    let name = CFString::new(P::NAME);
+    let preset_number = CFNumber::from(0);
     let data = CFData::from_buffer(serialized_state);
 
     CFDictionary::from_CFType_pairs(&[
@@ -3575,8 +3977,31 @@ fn class_info_dictionary<P: Auv2Plugin>(serialized_state: &[u8]) -> CFDictionary
         (type_key, type_code.as_CFType()),
         (subtype_key, subtype_code.as_CFType()),
         (manufacturer_key, manufacturer_code.as_CFType()),
+        (name_key, name.as_CFType()),
+        (preset_number_key, preset_number.as_CFType()),
         (data_key, data.as_CFType()),
     ])
+}
+
+fn parse_auv2_version(version: &str) -> u32 {
+    let version = version.split_once('-').map(|(version, _)| version).unwrap_or(version);
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+
+    (pack_bcd_version(major, 4) << 16)
+        | (pack_bcd_version(minor, 2) << 8)
+        | pack_bcd_version(patch, 2)
+}
+
+fn pack_bcd_version(mut value: u32, digits: usize) -> u32 {
+    let mut result = 0;
+    for shift in 0..digits {
+        result |= (value % 10) << (shift * 4);
+        value /= 10;
+    }
+    result
 }
 
 fn deserialize_class_info(dictionary: &CFDictionary<CFString, CFType>) -> Option<PluginState> {
